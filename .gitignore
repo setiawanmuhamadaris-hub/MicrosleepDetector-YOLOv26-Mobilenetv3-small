@@ -13,3 +13,7 @@ venv.bak/
 
 # Streamlit
 .streamlit/
+
+# Custom virtual envs
+env-*
+
