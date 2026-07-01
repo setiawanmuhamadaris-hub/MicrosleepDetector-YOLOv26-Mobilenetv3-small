@@ -4,3 +4,5 @@ torch
 torchvision
 ultralytics
 numpy
+
+streamlit-webrtc
