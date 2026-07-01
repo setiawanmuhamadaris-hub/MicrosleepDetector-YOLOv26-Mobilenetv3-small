@@ -1,156 +1,155 @@
 import streamlit as st
 import cv2
-import torch
-import torch.nn as nn
-import torchvision.transforms as T
-import ultralytics.nn.modules.block as block
-from ultralytics import YOLO
-from torchvision.models import mobilenet_v3_small
-import numpy as np
 import time
-import threading
 import winsound
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+
+from auth import init_session_state, show_login_form
+from models_handler import load_models, AttentionEnhancedBottleneck
+from processor import VideoProcessor, process_frame_local
+import sys
+
+# Hack agar PyTorch bisa memuat weight yang sebelumnya dilatih di __main__ (app.py)
+setattr(sys.modules['__main__'], 'AttentionEnhancedBottleneck', AttentionEnhancedBottleneck)
 
 # ==========================================
 # 1. KONFIGURASI HALAMAN STREAMLIT
 # ==========================================
-st.set_page_config(page_title="Deteksi Microsleep", page_icon="👁️", layout="wide")
+st.set_page_config(page_title="Deteksi Microsleep Real-Time", page_icon="👁️", layout="wide")
+
+# Custom CSS
+st.markdown("""
+    <style>
+    .main { background-color: #0e1117; color: white; }
+    div[data-testid="stMetricValue"] { color: #00ff00; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# Inisialisasi Session State
+init_session_state()
+
+# Pre-load models (Cached)
+try:
+    load_models()
+except Exception as e:
+    st.error(f"Error loading models: {e}")
+    st.stop()
+
+# ==========================================
+# 2. SIDEBAR & KONTROL UI
+# ==========================================
+if st.session_state.logged_in:
+    st.sidebar.header("Control Panel")
+    st.sidebar.success("✅ Logged in as Admin")
+    
+    st.session_state.camera_mode = st.sidebar.radio(
+        "Mode Kamera",
+        ("Lokal (OpenCV)", "Cloud (WebRTC)")
+    )
+    
+    st.session_state.global_conf_threshold = st.sidebar.slider(
+        "Confidence Threshold",
+        0.1, 1.0,
+        st.session_state.global_conf_threshold,
+    )
+    st.session_state.global_alert_duration = st.sidebar.slider(
+        "Durasi Alarm (detik)", 
+        1.0, 5.0, 
+        st.session_state.global_alert_duration,
+    )
+    if st.sidebar.button("🚪 Logout", use_container_width=True):
+        st.session_state.logged_in = False
+        st.rerun()
+else:
+    if st.sidebar.button("🔑 Login Admin", use_container_width=True, type="primary"):
+        st.session_state.show_login = True
+        st.rerun()
+
+if st.session_state.show_login and not st.session_state.logged_in:
+    show_login_form()
+    st.stop()
+
+# ==========================================
+# 3. MAIN UI & LOGIC
+# ==========================================
 st.title("👁️ Sistem Deteksi Microsleep Real-Time")
 st.markdown("**Proyek Akhir Machine Learning** | YOLOv26 (Deteksi Wajah) + MobileNetV3 (Klasifikasi Kantuk)")
+st.markdown("---")
 
-# ==========================================
-# 2. MONKEY PATCHING ARSITEKTUR (WAJIB)
-# ==========================================
-class AttentionEnhancedBottleneck(nn.Module):
-    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
-        super().__init__()
-        c_ = int(c2 * e)
-        self.cv1 = block.Conv(c1, c_, k[0], 1)
-        self.cv2 = block.Conv(c_, c2, k[1], 1, g=g)
-        self.add = shortcut and c1 == c2
-        self.se = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(c2, c2 // 4, kernel_size=1),
-            nn.ReLU(),
-            nn.Conv2d(c2 // 4, c2, kernel_size=1),
-            nn.Sigmoid()
+col1, col2 = st.columns([3, 1])
+
+with col1:
+    st.write("### Live Camera Feed")
+    
+    if st.session_state.camera_mode == "Cloud (WebRTC)":
+        ctx = webrtc_streamer(
+            key="driver-monitoring",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration=RTCConfiguration({
+                "iceServers": [
+                    {"urls": ["stun:stun.l.google.com:19302"]},
+                    {"urls": ["stun:stun1.l.google.com:19302"]},
+                    {"urls": ["stun:stun2.l.google.com:19302"]},
+                ]
+            }),
+            video_processor_factory=VideoProcessor,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
         )
-    def forward(self, x):
-        out = self.cv2(self.cv1(x))
-        out = out * self.se(out)
-        return x + out if self.add else out
 
-# Terapkan patch secara global
-block.Bottleneck = AttentionEnhancedBottleneck
-
-# ==========================================
-# 3. CACHING MODEL (AGAR STREAMLIT TIDAK LEMOT)
-# ==========================================
-@st.cache_resource
-def load_models():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Load YOLOv26
-    yolo = YOLO('models/best.pt') 
-    
-    # Load MobileNetV3
-    mobilenet = mobilenet_v3_small()
-    mobilenet.classifier[3] = nn.Linear(mobilenet.classifier[3].in_features, 2)
-    # Ganti path ini ke lokasi file mobilenetv3_best.pth hasil downloadmu
-    mobilenet.load_state_dict(torch.load('models/mobilenetv3_best.pth', map_location=device, weights_only=True))
-    mobilenet = mobilenet.to(device)
-    mobilenet.eval()
-    
-    return yolo, mobilenet, device
-
-# Muat model ke memori
-yolo_model, mobilenet_model, device = load_models()
-
-# Transformasi MobileNet
-transform = T.Compose([
-    T.ToPILImage(),
-    T.Resize((224, 224)),
-    T.ToTensor(),
-    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
-class_names = ['Sadar', 'Microsleep']
-
-# ==========================================
-# 4. SIDEBAR & KONTROL UI
-# ==========================================
-st.sidebar.header("Kontrol Deteksi")
-conf_threshold = 0.5 # Ditetapkan 0.5 sesuai permintaan
-run_webcam = st.sidebar.checkbox("Mulai Kamera 🎥")
-
-st.sidebar.markdown("---")
-st.sidebar.info("Pastikan wajah terlihat jelas oleh kamera agar bounding box dapat memotong area dengan akurat.")
-
-# ==========================================
-# 5. MAIN LOOP WEBCAM
-# ==========================================
-# Placeholder untuk menampilkan frame video
-frame_window = st.image([])
-status_text = st.empty()
-
-if run_webcam:
-    cap = cv2.VideoCapture(0) # Gunakan ID 0 untuk webcam bawaan
-    last_beep_time = 0
-    
-    while run_webcam:
-        ret, frame = cap.read()
-        if not ret:
-            st.error("Gagal membaca sinyal kamera.")
-            break
+        if ctx.video_processor:
+            ctx.video_processor.conf_threshold = st.session_state.global_conf_threshold
+            ctx.video_processor.alert_duration = st.session_state.global_alert_duration
             
-        # YOLO Detection
-        results = yolo_model(frame, verbose=False, conf=conf_threshold)[0]
+    else:
+        # Mode Lokal (OpenCV)
+        run_webcam = st.checkbox("Mulai Kamera Lokal 🎥")
+        frame_window = st.empty()
+        status_text = st.empty()
         
-        current_status = "Tidak ada wajah terdeteksi"
-        
-        for box in results.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-            h, w, _ = frame.shape
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
+        if run_webcam:
+            cap = cv2.VideoCapture(0)
+            last_beep_time = 0
+            start_sleep_time = None
             
-            crop_img = frame[y1:y2, x1:x2]
-            
-            if crop_img.size > 0:
-                # Klasifikasi MobileNet
-                input_tensor = transform(crop_img).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    outputs = mobilenet_model(input_tensor)
-                    _, preds = torch.max(outputs, 1)
-                    label = class_names[preds.item()]
+            while run_webcam:
+                ret, frame = cap.read()
+                if not ret:
+                    st.error("Gagal membaca sinyal kamera.")
+                    break
                     
-                current_status = label
-                color = (0, 0, 255) if label == 'Microsleep' else (0, 255, 0)
+                processed_frame, current_status, start_sleep_time = process_frame_local(
+                    frame, 
+                    st.session_state.global_conf_threshold, 
+                    st.session_state.global_alert_duration, 
+                    start_sleep_time
+                )
                 
-                # Visualisasi Bounding Box
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-                cv2.rectangle(frame, (x1, y1 - text_h - 10), (x1 + text_w, y1), color, -1)
-                cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        
-        # Konversi warna OpenCV (BGR) ke format Streamlit (RGB)
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_window.image(frame_rgb)
-        
-        # Tampilkan status di bawah kamera
-        if current_status == "Microsleep":
-            status_text.error("⚠️ PERINGATAN: Pengemudi terdeteksi Microsleep!")
-            
-            # Bunyikan alarm beep tiap 0.5 detik tanpa memblokir frame video
-            current_time = time.time()
-            if current_time - last_beep_time > 0.5:
-                winsound.PlaySound('assets/beep.wav', winsound.SND_FILENAME | winsound.SND_ASYNC)
-                last_beep_time = current_time
+                frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+                frame_window.image(frame_rgb)
                 
-        elif current_status == "Sadar":
-            status_text.success("✅ Pengemudi dalam keadaan Sadar.")
+                current_time = time.time()
+                if current_status == "Microsleep":
+                    status_text.error("⚠️ PERINGATAN: Pengemudi terdeteksi Microsleep!")
+                    if current_time - last_beep_time > 0.5:
+                        winsound.PlaySound('assets/beep.wav', winsound.SND_FILENAME | winsound.SND_ASYNC)
+                        last_beep_time = current_time
+                else:
+                    status_text.success("✅ Pengemudi dalam keadaan Sadar.")
+                    
+            cap.release()
         else:
-            status_text.warning("Menunggu deteksi wajah...")
-            
-    cap.release()
-else:
-    st.info("Klik centang 'Mulai Kamera' di sidebar untuk memulai deteksi.")
+            st.info("Centang 'Mulai Kamera Lokal' untuk memulai deteksi.")
+
+with col2:
+    st.write("### Panduan")
+    st.info("""
+    1. Login sebagai Admin untuk mengakses kontrol panel.
+    2. Pilih Mode Kamera: **Lokal (OpenCV)** atau **Cloud (WebRTC)**.
+    3. Sistem akan mendeteksi wajah dan mengklasifikasikan kantuk.
+    4. Jika durasi tertidur > ambang batas, alarm akan menyala.
+    """)
+    if st.session_state.camera_mode == "Cloud (WebRTC)":
+        st.warning("Catatan: Mode Cloud (WebRTC) hanya mendukung peringatan visual karena keterbatasan browser untuk memutar audio secara otomatis.")
+    else:
+        st.success("Mode Lokal mendukung peringatan visual dan suara (beep).")
