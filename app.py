@@ -2,11 +2,10 @@ import streamlit as st
 import cv2
 import time
 import winsound
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
 from auth import init_session_state, show_login_form
 from models_handler import load_models, AttentionEnhancedBottleneck
-from processor import VideoProcessor, process_frame_local
+from processor import process_frame_local
 import sys
 
 # Hack agar PyTorch bisa memuat weight yang sebelumnya dilatih di __main__ (app.py)
@@ -42,11 +41,6 @@ if st.session_state.logged_in:
     st.sidebar.header("Control Panel")
     st.sidebar.success("✅ Logged in as Admin")
     
-    st.session_state.camera_mode = st.sidebar.radio(
-        "Mode Kamera",
-        ("Lokal (OpenCV)", "Cloud (WebRTC)")
-    )
-    
     st.session_state.global_conf_threshold = st.sidebar.slider(
         "Confidence Threshold",
         0.1, 1.0,
@@ -81,75 +75,57 @@ col1, col2 = st.columns([3, 1])
 with col1:
     st.write("### Live Camera Feed")
     
-    if st.session_state.camera_mode == "Cloud (WebRTC)":
-        ctx = webrtc_streamer(
-            key="driver-monitoring",
-            mode=WebRtcMode.SENDRECV,
-            rtc_configuration=RTCConfiguration({
-                "iceServers": [
-                    {"urls": ["stun:stun.l.google.com:19302"]},
-                    {"urls": ["stun:stun1.l.google.com:19302"]},
-                    {"urls": ["stun:stun2.l.google.com:19302"]},
-                ]
-            }),
-            video_processor_factory=VideoProcessor,
-            media_stream_constraints={"video": True, "audio": False},
-            async_processing=True,
-        )
-
-        if ctx.video_processor:
-            ctx.video_processor.conf_threshold = st.session_state.global_conf_threshold
-            ctx.video_processor.alert_duration = st.session_state.global_alert_duration
-            
-    else:
-        # Mode Lokal (OpenCV)
-        run_webcam = st.checkbox("Mulai Kamera Lokal 🎥")
-        frame_window = st.empty()
-        status_text = st.empty()
+    run_webcam = st.checkbox("Mulai Kamera 🎥")
+    frame_window = st.empty()
+    status_text = st.empty()
+    
+    if run_webcam:
+        cap = cv2.VideoCapture(0)
+        last_beep_time = 0
+        start_sleep_time = None
+        prev_time = time.time()
         
-        if run_webcam:
-            cap = cv2.VideoCapture(0)
-            last_beep_time = 0
-            start_sleep_time = None
+        while run_webcam:
+            ret, frame = cap.read()
+            if not ret:
+                st.error("Gagal membaca sinyal kamera.")
+                break
             
-            while run_webcam:
-                ret, frame = cap.read()
-                if not ret:
-                    st.error("Gagal membaca sinyal kamera.")
-                    break
-                    
-                processed_frame, current_status, start_sleep_time = process_frame_local(
-                    frame, 
-                    st.session_state.global_conf_threshold, 
-                    st.session_state.global_alert_duration, 
-                    start_sleep_time
-                )
+            # Hitung FPS dari selisih waktu antar-frame
+            curr_time = time.time()
+            fps = 1.0 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0.0
+            prev_time = curr_time
+            
+            processed_frame, current_status, start_sleep_time = process_frame_local(
+                frame, 
+                st.session_state.global_conf_threshold, 
+                st.session_state.global_alert_duration, 
+                start_sleep_time,
+                fps=fps
+            )
+            
+            frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+            frame_window.image(frame_rgb)
+            
+            current_time = time.time()
+            if current_status == "Microsleep":
+                status_text.error("⚠️ PERINGATAN: Pengemudi terdeteksi Microsleep!")
+                if current_time - last_beep_time > 0.5:
+                    winsound.PlaySound('assets/beep.wav', winsound.SND_FILENAME | winsound.SND_ASYNC)
+                    last_beep_time = current_time
+            else:
+                status_text.success("✅ Pengemudi dalam keadaan Sadar.")
                 
-                frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
-                frame_window.image(frame_rgb)
-                
-                current_time = time.time()
-                if current_status == "Microsleep":
-                    status_text.error("⚠️ PERINGATAN: Pengemudi terdeteksi Microsleep!")
-                    if current_time - last_beep_time > 0.5:
-                        winsound.PlaySound('assets/beep.wav', winsound.SND_FILENAME | winsound.SND_ASYNC)
-                        last_beep_time = current_time
-                else:
-                    status_text.success("✅ Pengemudi dalam keadaan Sadar.")
-                    
-            cap.release()
-        else:
-            st.info("Centang 'Mulai Kamera Lokal' untuk memulai deteksi.")
+        cap.release()
+    else:
+        st.info("Centang 'Mulai Kamera' untuk memulai deteksi.")
 
 with col2:
     st.write("### Panduan")
     st.info("""
     1. Login sebagai Admin untuk mengakses kontrol panel.
-    2. Pilih Mode Kamera: **Lokal (OpenCV)** atau **Cloud (WebRTC)**.
+    2. Klik **Mulai Kamera** untuk memulai deteksi.
     3. Sistem akan mendeteksi wajah dan mengklasifikasikan kantuk.
     4. Jika durasi tertidur > ambang batas, alarm akan menyala.
     """)
-    if st.session_state.camera_mode == "Cloud (WebRTC)":
-        st.warning("Catatan: Mode Cloud (WebRTC) hanya mendukung peringatan visual karena keterbatasan browser untuk memutar audio secara otomatis.")
-    else:
-        st.success("Mode Lokal mendukung peringatan visual dan suara (beep).")
+    st.success("Mode Lokal mendukung peringatan visual dan suara (beep).")

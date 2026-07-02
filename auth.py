@@ -33,5 +33,4 @@ def init_session_state():
         st.session_state.global_conf_threshold = 0.5
     if 'global_alert_duration' not in st.session_state:
         st.session_state.global_alert_duration = 2.0
-    if 'camera_mode' not in st.session_state:
-        st.session_state.camera_mode = "Lokal (OpenCV)"
+
