@@ -11,8 +11,8 @@ ENV/
 env.bak/
 venv.bak/
 
-# Streamlit
-.streamlit/
+# Streamlit (secrets harus dirahasiakan, config.toml boleh di-commit)
+.streamlit/secrets.toml
 
 # Custom virtual envs
 env-*

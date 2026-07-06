@@ -1,7 +1,8 @@
 streamlit
-opencv-python
+streamlit-webrtc
+opencv-python-headless
 torch
 torchvision
 ultralytics
 numpy
-
+av
