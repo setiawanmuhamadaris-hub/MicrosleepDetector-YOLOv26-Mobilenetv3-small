@@ -1,16 +1,17 @@
 import streamlit as st
-import streamlit.components.v1 as components
-import av
+import cv2
 import time
-import base64
-import threading
-from pathlib import Path
+import winsound
 
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+try:
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+    WEBRTC_AVAILABLE = True
+except ImportError:
+    WEBRTC_AVAILABLE = False
 
 from auth import init_session_state, show_login_form
 from models_handler import load_models, AttentionEnhancedBottleneck
-from processor import process_frame_local
+from processor import VideoProcessor, process_frame_local, DISPLAY_W
 import sys
 
 # Hack agar PyTorch bisa memuat weight yang sebelumnya dilatih di __main__ (app.py)
@@ -40,51 +41,16 @@ except Exception as e:
     st.stop()
 
 # ==========================================
-# 2. HELPER: Audio Alert via Browser HTML5
-# ==========================================
-@st.cache_data
-def get_audio_base64():
-    """Encode file beep.wav ke base64 agar bisa dimainkan di browser."""
-    audio_path = Path("assets/beep.wav")
-    if audio_path.exists():
-        audio_bytes = audio_path.read_bytes()
-        return base64.b64encode(audio_bytes).decode()
-    return None
-
-def get_play_audio_html(audio_b64):
-    """Menghasilkan HTML statis untuk memainkan audio.
-    Karena string statis (tanpa timestamp), Streamlit tidak akan me-recreate
-    iframe ini setiap detik. Script ini hanya jalan 1x saat status berubah ke Microsleep."""
-    return f"""
-    <script>
-        var p = window.parent;
-        if (p._msAudio) {{
-            p._msAudio.pause();
-        }}
-        p._msAudio = new Audio("data:audio/wav;base64,{audio_b64}");
-        p._msAudio.loop = true;
-        p._msAudio.play().catch(function(e) {{ console.log("Audio play blocked/error:", e); }});
-    </script>
-    """
-
-def get_stop_audio_html():
-    """Menghasilkan HTML statis untuk menghentikan audio."""
-    return """
-    <script>
-        var p = window.parent;
-        if (p._msAudio) {
-            p._msAudio.pause();
-            p._msAudio = null;
-        }
-    </script>
-    """
-
-# ==========================================
-# 3. SIDEBAR & KONTROL UI
+# 2. SIDEBAR & KONTROL UI
 # ==========================================
 if st.session_state.logged_in:
     st.sidebar.header("Control Panel")
     st.sidebar.success("✅ Logged in as Admin")
+    
+    st.session_state.camera_mode = st.sidebar.radio(
+        "Mode Kamera",
+        ("Lokal (OpenCV)", "Cloud (WebRTC)")
+    )
     
     st.session_state.global_conf_threshold = st.sidebar.slider(
         "Confidence Threshold",
@@ -109,55 +75,7 @@ if st.session_state.show_login and not st.session_state.logged_in:
     st.stop()
 
 # ==========================================
-# 4. WEBRTC VIDEO PROCESSOR
-# ==========================================
-class MicrosleepVideoProcessor(VideoProcessorBase):
-    """
-    Callback WebRTC yang berjalan di thread terpisah.
-    Menerima frame dari browser, memproses deteksi microsleep,
-    lalu mengembalikan frame dengan overlay visual.
-    """
-    def __init__(self):
-        self.conf_threshold = 0.5
-        self.alert_duration = 2.0
-        self.start_sleep_time = None
-        self._lock = threading.Lock()
-        self._status = "Sadar"
-        self._prev_time = time.time()
-
-    @property
-    def status(self):
-        with self._lock:
-            return self._status
-
-    @status.setter
-    def status(self, value):
-        with self._lock:
-            self._status = value
-
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="bgr24")
-
-        # Hitung FPS dari selisih waktu antar-frame
-        curr_time = time.time()
-        fps = 1.0 / (curr_time - self._prev_time) if (curr_time - self._prev_time) > 0 else 0.0
-        self._prev_time = curr_time
-
-        # Proses frame: deteksi wajah + klasifikasi kantuk + overlay visual
-        processed_frame, current_status, self.start_sleep_time = process_frame_local(
-            img,
-            self.conf_threshold,
-            self.alert_duration,
-            self.start_sleep_time,
-            fps=fps
-        )
-
-        self.status = current_status
-
-        return av.VideoFrame.from_ndarray(processed_frame, format="bgr24")
-
-# ==========================================
-# 5. MAIN UI & LOGIC
+# 3. MAIN UI & LOGIC
 # ==========================================
 st.title("👁️ Sistem Deteksi Microsleep Real-Time")
 st.markdown("**Proyek Akhir Machine Learning** | YOLOv26 (Deteksi Wajah) + MobileNetV3 (Klasifikasi Kantuk)")
@@ -168,60 +86,100 @@ col1, col2 = st.columns([3, 1])
 with col1:
     st.write("### Live Camera Feed")
     
-    # Konfigurasi ICE Server untuk WebRTC (STUN gratis dari Google)
-    RTC_CONFIGURATION = {
-        "iceServers": [
-            {"urls": ["stun:stun.l.google.com:19302"]},
-            {"urls": ["stun:stun1.l.google.com:19302"]},
-        ]
-    }
-
-    ctx = webrtc_streamer(
-        key="microsleep-detection",
-        video_processor_factory=MicrosleepVideoProcessor,
-        rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=True,
-    )
-
-    # ==========================================
-    # 6. STATUS MONITOR (auto-refresh setiap 1 detik)
-    # ==========================================
-    @st.fragment(run_every=1)
-    def status_monitor():
-        """
-        Fragment yang berjalan otomatis setiap 1 detik (tanpa me-restart WebRTC).
-        Mengecek status dari video processor dan mengontrol audio alarm.
-        """
-        if ctx.video_processor:
-            # Sinkronkan setting dari sidebar ke processor
-            ctx.video_processor.conf_threshold = st.session_state.global_conf_threshold
-            ctx.video_processor.alert_duration = st.session_state.global_alert_duration
-
-            # Cek status terkini dari processor thread
-            current_status = ctx.video_processor.status
-            if current_status == "Microsleep":
-                st.error("⚠️ PERINGATAN: Pengemudi terdeteksi Microsleep!")
-                audio_b64 = get_audio_base64()
-                if audio_b64:
-                    components.html(get_play_audio_html(audio_b64), height=0)
-            else:
-                st.success("✅ Pengemudi dalam keadaan Sadar.")
-                components.html(get_stop_audio_html(), height=0)
+    if st.session_state.camera_mode == "Cloud (WebRTC)":
+        if not WEBRTC_AVAILABLE:
+            st.error("Modul 'streamlit-webrtc' tidak terinstal atau tidak dapat dimuat. Pastikan modul tersebut terinstal.")
         else:
-            st.info("Klik **START** untuk memulai deteksi melalui webcam.")
+            ctx = webrtc_streamer(
+                key="driver-monitoring",
+                mode=WebRtcMode.SENDRECV,
+                rtc_configuration=RTCConfiguration({
+                    "iceServers": [
+                        {"urls": ["stun:stun.l.google.com:19302"]},
+                        {"urls": ["stun:stun1.l.google.com:19302"]},
+                        {"urls": ["stun:stun2.l.google.com:19302"]},
+                    ]
+                }),
+                video_processor_factory=VideoProcessor,
+                media_stream_constraints={"video": True, "audio": False},
+                async_processing=True,
+            )
 
-    status_monitor()
+            if ctx.video_processor:
+                ctx.video_processor.conf_threshold = st.session_state.global_conf_threshold
+                ctx.video_processor.alert_duration = st.session_state.global_alert_duration
+            
+    else:
+        # Mode Lokal (OpenCV)
+        run_webcam = st.checkbox("Mulai Kamera Lokal 🎥")
+        frame_window = st.empty()
+        status_text = st.empty()
+        
+        if run_webcam:
+            cap = cv2.VideoCapture(0)
+            # Set resolusi kamera lebih rendah agar capture lebih cepat
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            last_beep_time  = 0
+            start_sleep_time = None
+            last_time        = time.time()
+            prev_status      = None   # track perubahan status agar tidak update tiap frame
+            frame_count      = 0
+
+            while run_webcam:
+                ret, frame = cap.read()
+                if not ret:
+                    st.error("Gagal membaca sinyal kamera.")
+                    break
+
+                frame_count += 1
+                processed_frame, current_status, start_sleep_time = process_frame_local(
+                    frame,
+                    st.session_state.global_conf_threshold,
+                    st.session_state.global_alert_duration,
+                    start_sleep_time,
+                    frame_count
+                )
+
+                current_time = time.time()
+                fps = 1.0 / (current_time - last_time) if (current_time - last_time) > 0 else 0.0
+                last_time = current_time
+                cv2.putText(processed_frame, f"FPS: {fps:.1f}", (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+                # Resize frame sebelum dikirim ke browser (hemat bandwidth & rendering)
+                frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+                h, w = frame_rgb.shape[:2]
+                if w > DISPLAY_W:
+                    frame_rgb = cv2.resize(frame_rgb, (DISPLAY_W, int(h * DISPLAY_W / w)))
+                frame_window.image(frame_rgb)
+
+                # Update status hanya saat berubah (hemat Streamlit re-render)
+                if current_status != prev_status:
+                    if current_status == "Microsleep":
+                        status_text.error("⚠️ PERINGATAN: Pengemudi terdeteksi Microsleep!")
+                    else:
+                        status_text.success("✅ Pengemudi dalam keadaan Sadar.")
+                    prev_status = current_status
+
+                if current_status == "Microsleep":
+                    if current_time - last_beep_time > 0.5:
+                        winsound.PlaySound('assets/beep.wav', winsound.SND_FILENAME | winsound.SND_ASYNC)
+                        last_beep_time = current_time
+
+            cap.release()
+        else:
+            st.info("Centang 'Mulai Kamera Lokal' untuk memulai deteksi.")
 
 with col2:
     st.write("### Panduan")
     st.info("""
     1. Login sebagai Admin untuk mengakses kontrol panel.
-    2. Klik **START** untuk memulai deteksi webcam.
-    3. Izinkan akses kamera pada browser.
-    4. Sistem akan mendeteksi wajah dan mengklasifikasikan kantuk.
-    5. Jika durasi tertidur > ambang batas, peringatan akan muncul.
+    2. Pilih Mode Kamera: **Lokal (OpenCV)** atau **Cloud (WebRTC)**.
+    3. Sistem akan mendeteksi wajah dan mengklasifikasikan kantuk.
+    4. Jika durasi tertidur > ambang batas, alarm akan menyala.
     """)
-    st.warning("⚠️ Pastikan browser mengizinkan akses kamera.")
-    st.success("Deteksi visual (bounding box, label, warning) langsung tampil pada video feed secara real-time.")
-
+    if st.session_state.camera_mode == "Cloud (WebRTC)":
+        st.warning("Catatan: Mode Cloud (WebRTC) hanya mendukung peringatan visual karena keterbatasan browser untuk memutar audio secara otomatis.")
+    else:
+        st.success("Mode Lokal mendukung peringatan visual dan suara (beep).")
